@@ -1,3 +1,1 @@
-trigger: 2026-11-24 17:28 CST 首次验证手动构建
-build-type: release
-force: true
+trigger: 2026-11-24 17:34 CST 第二次（强制构建）
