@@ -1,6 +1,9 @@
 name: 上游同步与自动构建
 
 on:
+  push:
+    paths:
+      - '.github/trigger/**'
   workflow_dispatch:
     inputs:
       build-type:
@@ -102,14 +105,13 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          : "${SIGNING_KEY:?缺少 Secret：SIGNING_KEY}"
-          : "${KEY_STORE_PASSWORD:?缺少 Secret：KEY_STORE_PASSWORD}"
-          : "${KEY_ALIAS:?缺少 Secret：ALIAS}"
-          : "${KEY_PASSWORD:?缺少 Secret：KEY_PASSWORD}"
+          : "${SIGNING_KEY:?缺少 Secret SIGNING_KEY}"
+          : "${KEY_STORE_PASSWORD:?缺少 Secret KEY_STORE_PASSWORD}"
+          : "${KEY_ALIAS:?缺少 Secret ALIAS}"
+          : "${KEY_PASSWORD:?缺少 Secret KEY_PASSWORD}"
           printf '%s' "$SIGNING_KEY" | base64 --decode > "$GITHUB_WORKSPACE/release.jks"
           test -s "$GITHUB_WORKSPACE/release.jks"
-          keytool -list -keystore "$GITHUB_WORKSPACE/release.jks" \
-            -storepass "$KEY_STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1
+          keytool -list -keystore "$GITHUB_WORKSPACE/release.jks" -storepass "$KEY_STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1
 
       - name: 构建 APK
         if: steps.sync.outputs.changed == 'true'
@@ -120,9 +122,7 @@ jobs:
           RELEASE_KEY_PASSWORD: ${{ env.BUILD_TYPE == 'release' && secrets.KEY_PASSWORD || '' }}
         run: |
           set -euo pipefail
-          ./gradlew "$GRADLE_TASK" \
-            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
-            --build-cache --continue --stacktrace
+          ./gradlew "$GRADLE_TASK" -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" --build-cache --continue --stacktrace
 
       - name: 收集 APK
         if: steps.sync.outputs.changed == 'true'
