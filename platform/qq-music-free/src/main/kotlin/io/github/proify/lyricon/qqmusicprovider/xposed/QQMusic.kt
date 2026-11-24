@@ -9,7 +9,11 @@
 package io.github.proify.lyricon.qqmusicprovider.xposed
 
 import android.app.Application
+import android.app.Notification
+import android.app.NotificationManager
+import android.media.session.MediaSession
 import android.media.session.PlaybackState
+import android.os.Bundle
 import android.util.Base64
 import com.highcapable.kavaref.extension.classOf
 import com.highcapable.yukihookapi.extension.kavaref.toClass
@@ -47,10 +51,34 @@ object QQMusic : YukiBaseHooker() {
 
     private const val LYRIC_DIR = "QPlayEdge/lyric"
 
+    /** MediaStyle 通知里保存会话令牌的键（Notification.EXTRA_MEDIA_SESSION）。 */
+    private const val EXTRA_MEDIA_SESSION = "android.mediaSession"
+
+    /** 通知样式键（Notification.EXTRA_TEMPLATE）。 */
+    private const val EXTRA_TEMPLATE = "android.template"
+
+    /** 媒体样式模板类名。 */
+    private const val TEMPLATE_MEDIA_STYLE = "android.app.Notification\$MediaStyle"
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private var provider: LyriconProvider? = null
     private var application: Application? = null
+
+    /**
+     * 简洁版自己的媒体会话令牌。
+     *
+     * 系统（HyperOS 音乐岛 / 媒体卡片）靠 MediaStyle 通知里的
+     * `android.mediaSession` 令牌把通知与会话绑在一起；简洁版发的通知虽然是
+     * MediaStyle，但 extras 里不带这个令牌，于是系统只当成普通常驻通知，不建音乐岛。
+     * 这里在会话创建 / 更新播放状态时抓一份令牌，发通知时补进去。
+     */
+    @Volatile
+    private var sessionToken: MediaSession.Token? = null
+
+    /** 补令牌日志节流（毫秒）。 */
+    @Volatile
+    private var lastPatchedAt = 0L
 
     @Volatile
     private var currentTitle: String? = null
@@ -83,6 +111,7 @@ object QQMusic : YukiBaseHooker() {
         hookMediaSession()
         hookTrackChange()
         hookLyricRequest()
+        hookMediaNotification()
     }
 
     private fun ensureProvider(): LyriconProvider? {
@@ -107,6 +136,15 @@ object QQMusic : YukiBaseHooker() {
     private fun hookMediaSession() {
         val sessionClass = "android.media.session.MediaSession".toClass()
 
+        // 会话一构造出来就把令牌存下（这时 App 通常还没发通知）
+        sessionClass.declaredConstructors.forEach { constructor ->
+            constructor.hook {
+                after {
+                    captureSessionToken(instanceOrNull)
+                }
+            }
+        }
+
         val playbackState = sessionClass.declaredMethods.firstOrNull {
             it.name == "setPlaybackState" &&
                     it.parameterTypes.size == 1 &&
@@ -120,6 +158,8 @@ object QQMusic : YukiBaseHooker() {
 
         playbackState.hook {
             after {
+                captureSessionToken(instanceOrNull)
+
                 runCatching {
                     val state = args[0] as? PlaybackState ?: return@runCatching
 
@@ -142,6 +182,92 @@ object QQMusic : YukiBaseHooker() {
                     YLog.error(tag = TAG, msg = "setPlaybackState failed", e = it)
                 }
             }
+        }
+    }
+
+    /** 抓取并缓存当前媒体会话令牌，可重复调用。 */
+    private fun captureSessionToken(sessionInstance: Any?) {
+        val session = sessionInstance ?: return
+
+        val token = runCatching {
+            val getter = session.javaClass.methods.firstOrNull {
+                it.name == "getSessionToken" && it.parameterCount == 0
+            } ?: return
+            getter.invoke(session) as? MediaSession.Token
+        }.getOrNull() ?: return
+
+        if (sessionToken == null) {
+            YLog.info(tag = TAG, msg = "session token captured: " + session.javaClass.name)
+        }
+        sessionToken = token
+    }
+
+    /**
+     * 给简洁版自己发的 MediaStyle 通知补上媒体会话令牌。
+     *
+     * 简洁版是前台服务放媒体通知，实际走的是 `Service.startForeground(...)`，
+     * 不一定经过 NotificationManager.notify，所以两条路都要接。
+     * 通知是 MediaStyle 且 extras 里没有 android.mediaSession 时，把缓存的令牌塞进去；
+     * 令牌还没抓到（会话尚未创建）时原样放过，等下一次通知更新再补。
+     */
+    private fun hookMediaNotification() {
+        val notifyMethods = "android.app.NotificationManager".toClass()
+            .declaredMethods
+            .filter { method ->
+                method.parameterTypes.isNotEmpty() &&
+                        method.parameterTypes.last() == Notification::class.java &&
+                        (method.name == "notify" || method.name == "notifyAsPackage")
+            }
+
+        val foregroundMethods = "android.app.Service".toClass()
+            .declaredMethods
+            .filter { method ->
+                method.name == "startForeground" &&
+                        method.parameterTypes.isNotEmpty() &&
+                        method.parameterTypes.last() != Notification::class.java &&
+                        method.parameterTypes.any { it == Notification::class.java }
+            }
+
+        if (notifyMethods.isEmpty() && foregroundMethods.isEmpty()) {
+            YLog.error(tag = TAG, msg = "media notification hook target not found")
+            return
+        }
+
+        (notifyMethods + foregroundMethods).forEach { method ->
+            method.hook {
+                before {
+                    val notification = args.firstOrNull { it is Notification } as? Notification
+                        ?: return@before
+                    patchMediaSessionToken(notification)
+                }
+            }
+        }
+
+        YLog.info(
+            tag = TAG,
+            msg = "media notification hooked: notify=" + notifyMethods.size +
+                    ", startForeground=" + foregroundMethods.size
+        )
+    }
+
+    /** 把会话令牌补进 MediaStyle 通知的 extras（已有令牌的绝不覆盖）。 */
+    private fun patchMediaSessionToken(notification: Notification) {
+        val token = sessionToken ?: return
+
+        val extras: Bundle = notification.extras ?: return
+        if (extras.containsKey(EXTRA_MEDIA_SESSION)) return
+        if (extras.getString(EXTRA_TEMPLATE) != TEMPLATE_MEDIA_STYLE) return
+
+        runCatching {
+            extras.putParcelable(EXTRA_MEDIA_SESSION, token)
+        }.onSuccess {
+            val now = System.currentTimeMillis()
+            if (now - lastPatchedAt > 2000L) {
+                lastPatchedAt = now
+                YLog.info(tag = TAG, msg = "patched mediaSession token into MediaStyle notification")
+            }
+        }.onFailure {
+            YLog.error(tag = TAG, msg = "patch mediaSession token failed", e = it)
         }
     }
 
