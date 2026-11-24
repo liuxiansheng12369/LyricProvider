@@ -33,7 +33,8 @@ env:
   UPSTREAM_URL: https://github.com/tomakino/LyricProvider.git
   BUILD_TYPE: ${{ inputs.build-type || 'release' }}
   GRADLE_TASK: ${{ (inputs.build-type || 'release') == 'release' && 'assembleRelease' || 'assembleDebug' }}
-  FORCE_BUILD: ${{ inputs.force || 'false' }}
+  # push 触发（改 .github/trigger 下的文件）一律强制构建，仅 schedule 走增量判断
+  FORCE_BUILD: ${{ github.event_name == 'push' || inputs.force || false }}
 
 jobs:
   sync-and-build:
@@ -64,6 +65,7 @@ jobs:
           BEHIND=$(git rev-list --count HEAD..upstream/master)
           AHEAD=$(git rev-list --count upstream/master..HEAD)
           echo "上游新提交 $BEHIND 条，本地独有提交 $AHEAD 条"
+          echo "强制构建=$FORCE_BUILD"
 
           if [[ "$BEHIND" -eq 0 && "$FORCE_BUILD" != "true" ]]; then
             echo "上游无新提交，跳过构建"
