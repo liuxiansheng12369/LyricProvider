@@ -103,6 +103,28 @@ def apk_signer_sha256(apksigner, apk):
     return match.group(1)
 
 
+def read_notes(notes_dir, module, version_name, provider_id):
+    """按约定路径取模块的更新说明；没有就返回 None。
+
+    查找顺序：<模块>/<版本名>.md -> <模块>.md -> <providerId>.md，
+    版本名带点的目录名（如 1.0.2）在 Windows 上也合法，不需要转义。
+    """
+    if not notes_dir:
+        return None
+    candidates = [
+        os.path.join(notes_dir, module, version_name + ".md"),
+        os.path.join(notes_dir, module + ".md"),
+        os.path.join(notes_dir, provider_id + ".md"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            with open(candidate, "r", encoding="utf-8") as handle:
+                text = handle.read().replace("\r\n", "\n").strip()
+            if text:
+                return text[:4000]
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--apk-dir")
@@ -110,6 +132,7 @@ def main():
     parser.add_argument("--tag")
     parser.add_argument("--commit")
     parser.add_argument("--resign-from", help="直接给已有的信封文件：只更新 revision 与有效期，条目原样保留")
+    parser.add_argument("--notes-dir", help="更新说明目录：按 <模块>/<版本>.md 或 <模块>.md 读取，内容写进条目的 releaseNotes")
     parser.add_argument("--key", required=True, help="目录签名私钥（PKCS#8 PEM）")
     parser.add_argument("--key-id", required=True)
     parser.add_argument("--revision", required=True, type=int)
@@ -127,6 +150,19 @@ def main():
         entries = payload["entries"]
         if not entries:
             raise SystemExit("已有目录里没有条目")
+        if args.notes_dir:
+            # 续签时把缺说明的条目补上，只在本地缺字段时才加，已经有说明的不覆盖
+            for entry in entries:
+                if entry.get("releaseNotes"):
+                    continue
+                notes = read_notes(
+                    args.notes_dir,
+                    entry["providerId"],
+                    entry.get("versionName", ""),
+                    entry["providerId"],
+                )
+                if notes:
+                    entry["releaseNotes"] = notes
     else:
         for name in ("apk_dir", "repo", "tag", "commit"):
             if not getattr(args, name):
@@ -160,7 +196,7 @@ def main():
             if info["versionCode"] < 1:
                 print("跳过 versionCode 不合规的模块：%s" % module, file=sys.stderr)
                 continue
-            entries.append({
+            entry = {
                 "providerId": provider_id,
                 "kind": "dedicated-lyrics",
                 "applicationId": info["applicationId"],
@@ -177,7 +213,11 @@ def main():
                     "sha256": sha256_file(apk_path),
                     "signerSha256": [apk_signer_sha256(apksigner, apk_path)],
                 },
-            })
+            }
+            notes = read_notes(args.notes_dir, module, entry["versionName"], provider_id)
+            if notes:
+                entry["releaseNotes"] = notes
+            entries.append(entry)
 
     if not entries:
         raise SystemExit("没有可发布的 APK 条目")
@@ -217,7 +257,9 @@ def main():
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(envelope, handle, ensure_ascii=False, separators=(",", ":"))
 
-    print("目录已生成：rev %d，%d 条，%d 字节" % (args.revision, len(entries), os.path.getsize(args.out)))
+    with_notes = sum(1 for entry in entries if entry.get("releaseNotes"))
+    print("目录已生成：rev %d，%d 条（%d 条带更新说明），%d 字节"
+          % (args.revision, len(entries), with_notes, os.path.getsize(args.out)))
 
 
 if __name__ == "__main__":
