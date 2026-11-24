@@ -1,0 +1,184 @@
+name: 上游同步与自动构建
+
+on:
+  workflow_dispatch:
+    inputs:
+      build-type:
+        description: '构建类型'
+        type: choice
+        options:
+          - release
+          - debug
+        default: release
+        required: true
+      force:
+        description: '上游无更新也强制构建一次'
+        type: boolean
+        default: true
+  schedule:
+    # 每天 18:00 (北京时间)
+    - cron: '0 10 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/tomakino/LyricProvider.git
+  BUILD_TYPE: ${{ inputs.build-type || 'release' }}
+  GRADLE_TASK: ${{ (inputs.build-type || 'release') == 'release' && 'assembleRelease' || 'assembleDebug' }}
+  FORCE_BUILD: ${{ inputs.force || 'false' }}
+
+jobs:
+  sync-and-build:
+    name: 同步上游并构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 配置提交身份
+        run: |
+          git config user.name "liuxiansheng autosync"
+          git config user.email "liuxiansheng12369@users.noreply.github.com"
+
+      - name: 同步上游
+        id: sync
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch --tags --prune upstream master
+
+          BEHIND=$(git rev-list --count HEAD..upstream/master)
+          AHEAD=$(git rev-list --count upstream/master..HEAD)
+          echo "上游新提交 $BEHIND 条，本地独有提交 $AHEAD 条"
+
+          if [[ "$BEHIND" -eq 0 && "$FORCE_BUILD" != "true" ]]; then
+            echo "上游无新提交，跳过构建"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$BEHIND" -gt 0 ]]; then
+            git merge --ff-only upstream/master || git merge --no-edit -X ours upstream/master
+            git push origin HEAD:master
+            echo "已同步到 $(git rev-parse --short HEAD)"
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: 配置 JDK 21
+        if: steps.sync.outputs.changed == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: 赋予 gradlew 执行权限
+        if: steps.sync.outputs.changed == 'true'
+        run: chmod +x ./gradlew
+
+      - name: 配置 Gradle 缓存
+        if: steps.sync.outputs.changed == 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+          cache-disabled: false
+
+      - name: 解码签名证书
+        if: steps.sync.outputs.changed == 'true' && env.BUILD_TYPE == 'release'
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${SIGNING_KEY:?缺少 Secret：SIGNING_KEY}"
+          : "${KEY_STORE_PASSWORD:?缺少 Secret：KEY_STORE_PASSWORD}"
+          : "${KEY_ALIAS:?缺少 Secret：ALIAS}"
+          : "${KEY_PASSWORD:?缺少 Secret：KEY_PASSWORD}"
+          printf '%s' "$SIGNING_KEY" | base64 --decode > "$GITHUB_WORKSPACE/release.jks"
+          test -s "$GITHUB_WORKSPACE/release.jks"
+          keytool -list -keystore "$GITHUB_WORKSPACE/release.jks" \
+            -storepass "$KEY_STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1
+
+      - name: 构建 APK
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          RELEASE_STORE_FILE: ${{ github.workspace }}/release.jks
+          RELEASE_STORE_PASSWORD: ${{ env.BUILD_TYPE == 'release' && secrets.KEY_STORE_PASSWORD || '' }}
+          RELEASE_KEY_ALIAS: ${{ env.BUILD_TYPE == 'release' && secrets.ALIAS || '' }}
+          RELEASE_KEY_PASSWORD: ${{ env.BUILD_TYPE == 'release' && secrets.KEY_PASSWORD || '' }}
+        run: |
+          set -euo pipefail
+          ./gradlew "$GRADLE_TASK" \
+            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
+            --build-cache --continue --stacktrace
+
+      - name: 收集 APK
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p collected-apks
+          mapfile -d '' APK_FILES < <(
+            find . -type f -name "*.apk" -path "*/build/outputs/apk/${BUILD_TYPE}/*" -print0
+          )
+          if (( ${#APK_FILES[@]} == 0 )); then
+            echo "::error::未生成任何 ${BUILD_TYPE} APK。"
+            exit 1
+          fi
+          for apk in "${APK_FILES[@]}"; do
+            cp -- "$apk" "collected-apks/$(basename "$apk")"
+          done
+          (
+            cd collected-apks
+            sha256sum *.apk > SHA256SUMS
+          )
+          ls -lh collected-apks/
+
+      - name: 上传制品
+        if: steps.sync.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUILD_TYPE }}-apks
+          path: collected-apks/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: 生成发布标记
+        if: steps.sync.outputs.changed == 'true'
+        id: stamp
+        run: |
+          echo "tag=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+          echo "label=$(date -u +'%Y-%m-%d %H:%M')" >> "$GITHUB_OUTPUT"
+
+      - name: 发布
+        if: steps.sync.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ steps.stamp.outputs.tag }}
+          name: Build ${{ steps.stamp.outputs.label }}
+          body: |
+            commit: ${{ github.sha }}
+            type: ${{ env.BUILD_TYPE }}
+            sync: tomakino/LyricProvider
+          prerelease: true
+          files: collected-apks/*.apk
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理
+        if: always()
+        run: |
+          rm -f release.jks || true
+          rm -rf collected-apks || true
