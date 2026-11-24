@@ -180,6 +180,30 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: 同步代码到 Gitee 镜像
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${GITEE_TOKEN:?缺少 Secret：GITEE_TOKEN}"
+          git push -q --force \
+            "https://luminous-brightness:${GITEE_TOKEN}@gitee.com/luminous-brightness/LyricProvider.git" \
+            "HEAD:master"
+
+      - name: 同步附件到 Gitee 镜像
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${GITEE_TOKEN:?缺少 Secret：GITEE_TOKEN}"
+          python3 .github/scripts/gitee_mirror.py upload \
+            --repo LyricProvider \
+            --tag "build-${{ steps.stamp.outputs.tag }}" \
+            --dir collected-apks \
+            --name "Build ${{ steps.stamp.outputs.label }}"
+
       - name: 准备目录签名密钥
         if: steps.sync.outputs.changed == 'true' && env.BUILD_TYPE == 'release'
         env:
@@ -213,10 +237,23 @@ jobs:
             --revision "$REV" \
             --out "$RUNNER_TEMP/catalog-stable.json"
 
+      - name: 目录前置 Gitee 直链
+        if: steps.sync.outputs.changed == 'true' && env.BUILD_TYPE == 'release'
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/gitee_mirror.py urls \
+            --catalog "$RUNNER_TEMP/catalog-stable.json" \
+            --repo LyricProvider \
+            --tag "build-${{ steps.stamp.outputs.tag }}" \
+            --key "$RUNNER_TEMP/catalog.pem" \
+            --key-id cll-catalog-liuxiansheng-2026a \
+            --out "$RUNNER_TEMP/catalog-stable.json"
+
       - name: 发布商店目录
         if: steps.sync.outputs.changed == 'true' && env.BUILD_TYPE == 'release'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/catalog-repo/catalog"
@@ -229,6 +266,11 @@ jobs:
           git add catalog/stable.json
           git commit -q -m "catalog: build-${{ steps.stamp.outputs.tag }}"
           git push -q "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" store-catalog --force
+          if [ -n "${GITEE_TOKEN:-}" ]; then
+            git push -q --force \
+              "https://luminous-brightness:${GITEE_TOKEN}@gitee.com/luminous-brightness/LyricProvider.git" \
+              store-catalog:store-catalog || echo "::warning::Gitee 目录分支同步失败，不影响 GitHub 侧发布"
+          fi
 
       - name: 清理
         if: always()
