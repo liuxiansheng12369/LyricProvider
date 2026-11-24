@@ -3,6 +3,10 @@ name: 刷新 CDN 目录缓存
 # 构建工作流每次发布完 store-catalog 后，jsDelivr 的边缘节点可能还把旧目录缓存
 # 几十分钟到十几小时，客户端就会一直读到上一版（表现为"商店里看不到新源"）。
 # 这里在构建成功结束后主动 purge 一次，保证国内客户端立刻拿到新目录。
+#
+# 注意：purge 接口返回的 JSON 是 `"status": "finished"`（冒号后有空格），而且被限流
+# 时也会返回 finished，只是 paths.*.throttled=true、带 throttlingReset 秒数。
+# 所以必须看 throttled 字段，只匹配字符串会把"被限流"误判成"已刷新"。
 
 on:
   workflow_run:
@@ -21,32 +25,39 @@ jobs:
   purge:
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: 刷新 jsDelivr 上的商店目录
         run: |
           set -uo pipefail
-          FILES=(
-            "catalog/stable.json"
-          )
-          FAILED=0
-          for f in "${FILES[@]}"; do
-            URL="https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@store-catalog/${f}"
-            OK=0
-            for i in 1 2 3 4; do
-              OUT=$(curl -sS --max-time 30 "$URL" || true)
-              echo "$OUT"
-              if printf '%s' "$OUT" | grep -q '"status":"finished"'; then
-                echo "已刷新：${f}"
-                OK=1
-                break
-              fi
-              echo "第 ${i} 次刷新未完成，6 秒后重试"
-              sleep 6
-            done
-            if [ "$OK" -eq 0 ]; then
-              FAILED=1
-              echo "::warning::${f} 的 jsDelivr 缓存未确认刷新，客户端可能仍读到旧目录"
+          URL="https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@store-catalog/catalog/stable.json"
+          STATE=""
+          for i in $(seq 1 6); do
+            OUT=$(curl -sS --max-time 30 "$URL" || true)
+            echo "$OUT"
+            THR=$(printf '%s' "$OUT" | sed -n 's/.*"throttlingReset": *\([0-9]\{1,\}\).*/\1/p' | head -1)
+            if printf '%s' "$OUT" | grep -qE '"throttled"[[:space:]]*:[[:space:]]*false'; then
+              STATE="ok"
+            elif [ -n "${THR:-}" ]; then
+              STATE="throttled:${THR}"
+            else
+              STATE="wait"
             fi
+            echo "第 ${i} 次结果：${STATE}"
+            case "$STATE" in
+              ok)
+                echo "jsDelivr 目录缓存已刷新"
+                exit 0
+                ;;
+              throttled:*)
+                WAIT=${STATE#throttled:}
+                [ "$WAIT" -gt 240 ] && WAIT=240
+                sleep "$WAIT"
+                ;;
+              *)
+                sleep 20
+                ;;
+            esac
           done
-          exit "$FAILED"
+          echo "::warning::jsDelivr 刷新未确认完成（可能仍在限流期），客户端可能读到旧目录"
+          exit 1
