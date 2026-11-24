@@ -12,7 +12,10 @@ import com.highcapable.yukihookapi.hook.xposed.YukiHookXposedModule
 
 @YukiHookLibXposedEntry(
     targetApiVersion = 101,
-    staticScope = false
+    scope = [
+        "com.miui.player",
+    ],
+    staticScope = true
 )
 open class HookEntry : YukiHookXposedModule {
 
@@ -25,6 +28,7 @@ open class HookEntry : YukiHookXposedModule {
     override fun onInit() {
         YukiHook.configure {
             logging {
+                enabled = true
                 tag = "MiuiMusicProvider"
             }
         }
