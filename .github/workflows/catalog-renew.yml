@@ -1,0 +1,85 @@
+name: 商店目录续签
+
+# 只续有效期，不重新编译：把已有目录的 revision +1、有效期往后推，条目原样保留。
+# 目的：上游长期没动静、没有新构建时，目录也不会到期。
+
+on:
+  schedule:
+    # 每周一 18:00（北京时间）
+    - cron: '0 10 * * 1'
+  push:
+    paths:
+      - '.github/renew/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: catalog-renew
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    name: 续签目录
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 取现有目录
+        run: |
+          set -euo pipefail
+          curl -sfL --retry 3 --retry-delay 2 \
+            "https://raw.githubusercontent.com/${{ github.repository }}/store-catalog/catalog/stable.json" \
+            -o "$RUNNER_TEMP/current.json"
+          test -s "$RUNNER_TEMP/current.json"
+
+      - name: 准备目录签名密钥
+        env:
+          CATALOG_KEY: ${{ secrets.CATALOG_KEY }}
+        run: |
+          set -euo pipefail
+          : "${CATALOG_KEY:?缺少 Secret：CATALOG_KEY}"
+          printf '%s' "$CATALOG_KEY" | base64 --decode > "$RUNNER_TEMP/catalog.pem"
+          test -s "$RUNNER_TEMP/catalog.pem"
+
+      - name: 续签
+        run: |
+          set -euo pipefail
+          PREV=$(python3 -c "import sys,json,base64;d=json.load(open(sys.argv[1]));print(json.loads(base64.b64decode(d['payload']))['catalogRevision'])" "$RUNNER_TEMP/current.json")
+          NEXT=$((PREV + 1))
+          echo "revision: $PREV -> $NEXT"
+          python3 .github/scripts/gen_catalog.py \
+            --resign-from "$RUNNER_TEMP/current.json" \
+            --key "$RUNNER_TEMP/catalog.pem" \
+            --key-id cll-catalog-liuxiansheng-2026a \
+            --revision "$NEXT" \
+            --validity-days 180 \
+            --out "$RUNNER_TEMP/stable.json"
+
+      - name: 推送目录
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/catalog-repo/catalog"
+          cp "$RUNNER_TEMP/stable.json" "$RUNNER_TEMP/catalog-repo/catalog/stable.json"
+          cd "$RUNNER_TEMP/catalog-repo"
+          git init -q
+          git checkout -q -b store-catalog
+          git config user.name "liuxiansheng autosync"
+          git config user.email "liuxiansheng12369@users.noreply.github.com"
+          git add catalog/stable.json
+          git commit -q -m "catalog: renew $(date -u +%Y-%m-%d)"
+          git push -q "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" store-catalog --force
+
+      - name: 清理
+        if: always()
+        run: rm -f "$RUNNER_TEMP/catalog.pem" || true
