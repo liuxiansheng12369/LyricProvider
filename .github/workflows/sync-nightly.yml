@@ -204,6 +204,7 @@ jobs:
           fi
           python3 .github/scripts/gen_catalog.py \
             --apk-dir collected-apks \
+            --notes-dir .github/catalog-notes \
             --repo "${{ github.repository }}" \
             --tag "build-${{ steps.stamp.outputs.tag }}" \
             --commit "${{ github.sha }}" \
