@@ -19,9 +19,11 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 DOMAIN = b"CLL-CATALOG-V1\n"
 API = "https://gitee.com/api/v5"
@@ -79,27 +81,41 @@ def cmd_upload(args):
     files = sorted(f for f in os.listdir(args.dir) if f.endswith(".apk"))
     if not files:
         raise SystemExit("目录里没有 APK：%s" % args.dir)
-    uploaded = skipped = 0
-    for name in files:
+    url = "%s/repos/%s/%s/releases/%s/attach_files" % (API, args.owner, args.repo, rel["id"])
+
+    def put(name):
+        """单文件上传，带重试。海外 runner 到 Gitee 经常断，单次失败不能拖垮整步。"""
         path = os.path.join(args.dir, name)
-        size = os.path.getsize(path)
-        # 同一 tag 下文件名已存在就跳过：Release 是不可变的，同名必然是同一份产物
-        if have.get(name):
-            skipped += 1
-            continue
-        url = "%s/repos/%s/%s/releases/%s/attach_files" % (API, args.owner, args.repo, rel["id"])
-        out = subprocess.run(
-            ["curl", "-sS", "--max-time", "300", "-X", "POST", url,
-             "-F", "access_token=" + token, "-F", "file=@" + path],
-            capture_output=True, text=True,
-        ).stdout
-        if '"browser_download_url"' in out:
-            uploaded += 1
-            print("  上传 %s（%d 字节）" % (name, size))
-        else:
-            print("  上传失败 %s :: %s" % (name, out[:200]), file=sys.stderr)
-            raise SystemExit(1)
-    print("Gitee 附件：新传 %d，已存在跳过 %d" % (uploaded, skipped))
+        last = ""
+        for attempt in range(1, 4):
+            out = subprocess.run(
+                ["curl", "-sS", "--max-time", "600", "--retry", "2", "--retry-delay", "5",
+                 "--retry-all-errors", "-X", "POST", url,
+                 "-F", "access_token=" + token, "-F", "file=@" + path],
+                capture_output=True, text=True,
+            ).stdout
+            if '"browser_download_url"' in out:
+                return name, True, "第 %d 次成功" % attempt
+            last = (out or "").strip()[:200]
+            time.sleep(5 * attempt)
+        return name, False, last
+
+    pending = [n for n in files if not have.get(n)]
+    skipped = len(files) - len(pending)
+    ok, failed = [], []
+    # 并发 6 路：串行时 22 个包要十几分钟，并发后受最大单文件带宽限制
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for name, good, msg in pool.map(put, pending):
+            if good:
+                ok.append(name)
+                print("  上传 %s（%s）" % (name, msg))
+            else:
+                failed.append(name)
+                print("  上传失败 %s :: %s" % (name, msg), file=sys.stderr)
+    print("Gitee 附件：新传 %d，已存在跳过 %d，失败 %d" % (len(ok), skipped, len(failed)))
+    if failed:
+        # 不让附件缺失卡死目录发布：目录里 Gitee 直链会 404，客户端按 urls 顺序回退到 GitHub
+        print("::warning::以下附件未上传成功，需下次补传：%s" % ", ".join(failed))
 
 
 def _openssl():
