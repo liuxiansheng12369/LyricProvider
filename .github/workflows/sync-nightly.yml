@@ -33,7 +33,7 @@ env:
   UPSTREAM_URL: https://github.com/tomakino/LyricProvider.git
   BUILD_TYPE: ${{ inputs.build-type || 'release' }}
   GRADLE_TASK: ${{ (inputs.build-type || 'release') == 'release' && 'assembleRelease' || 'assembleDebug' }}
-  FORCE_BUILD: ${{ inputs.force || 'false' }}
+  FORCE_BUILD: ${{ github.event_name == 'push' || inputs.force || false }}
 
 jobs:
   sync-and-build:
