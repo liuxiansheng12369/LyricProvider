@@ -58,6 +58,7 @@ jobs:
           echo "revision: $PREV -> $NEXT"
           python3 .github/scripts/gen_catalog.py \
             --resign-from "$RUNNER_TEMP/current.json" \
+            --notes-dir .github/catalog-notes \
             --key "$RUNNER_TEMP/catalog.pem" \
             --key-id cll-catalog-liuxiansheng-2026a \
             --revision "$NEXT" \
