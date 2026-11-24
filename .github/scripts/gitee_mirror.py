@@ -133,6 +133,16 @@ def _sign(payload_bytes, key_path):
         os.unlink(path)
 
 
+def _asset_exists(url):
+    """探测 Gitee 附件是否真的存在。存在时 302 跳到 foruda 拿文件，不存在是 404。"""
+    try:
+        req = urllib.request.Request(url, headers=dict(UA), method="HEAD")
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return 200 <= resp.status < 400
+    except Exception:
+        return False
+
+
 def cmd_urls(args):
     with open(args.catalog, "r", encoding="utf-8") as f:
         env = json.load(f)
@@ -144,30 +154,39 @@ def cmd_urls(args):
             hosts.append(h)
     payload["trustedHosts"] = hosts[:16]
 
-    rewritten = skipped = 0
+    jobs = []
+    skipped = 0
     for e in payload["entries"]:
         art = e["artifact"]
         urls = list(art.get("urls") or [])
-        gitee_url = None
+        gh = next((u for u in urls if u.startswith("https://github.com/")), None)
+        existing = next((u for u in urls if u.startswith("https://gitee.com/")), None)
         # 文件名以 GitHub 链接的末段为准：产物名两个镜像完全一致
-        for u in urls:
-            if u.startswith("https://github.com/"):
-                gitee_url = "https://gitee.com/%s/%s/releases/download/%s/%s" % (
-                    args.owner, args.repo, args.tag, u.rsplit("/", 1)[-1])
-                break
-        if gitee_url is None:
-            # 已经是 Gitee 直链在前的情况：取第一条 gitee 链接，换个 tag 重排
-            for u in urls:
-                if u.startswith("https://gitee.com/"):
-                    tail = u.rsplit("/", 3)[-1]
-                    gitee_url = "https://gitee.com/%s/%s/releases/download/%s/%s" % (
-                        args.owner, args.repo, args.tag, tail)
-                    break
-        if gitee_url is None:
+        if gh is None and existing is None:
             skipped += 1
             continue
-        rest = [u for u in urls if u != gitee_url]
-        art["urls"] = ([gitee_url] + rest)[:8]
+        name = (gh or existing).rsplit("/", 1)[-1]
+        target = "https://gitee.com/%s/%s/releases/download/%s/%s" % (
+            args.owner, args.repo, args.tag, name)
+        jobs.append((art, urls, gh, target))
+
+    # 逐个确认附件真的传上去了：海外 runner 到 Gitee 会偶发失败，
+    # 没传上去的包绝不能排到 urls[0]，否则客户端先去撞 404 再回退，反而更慢。
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda j: _asset_exists(j[3]), jobs))
+
+    rewritten = 0
+    missing = []
+    for (art, urls, gh, target), ok in zip(jobs, results):
+        if not ok:
+            missing.append(target.rsplit("/", 1)[-1])
+            # 镜像缺失：把该条目所有 Gitee 链接剔掉，保证 GitHub 排第一，
+            # 也避免旧 tag 的直链留在里面下到上一版的包
+            if gh is not None:
+                art["urls"] = [u for u in urls if not u.startswith("https://gitee.com/")][:8]
+            continue
+        rest = [u for u in urls if u != target]
+        art["urls"] = ([target] + rest)[:8]
         rewritten += 1
 
     now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
@@ -187,8 +206,10 @@ def cmd_urls(args):
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
 
-    print("目录改写完成：rev=%d，%d 条前置 Gitee 直链，%d 条无 GitHub 链接跳过，hosts=%d"
+    print("目录改写完成：rev=%d，%d 条前置 Gitee 直链，%d 条无可用链接跳过，hosts=%d"
           % (payload["catalogRevision"], rewritten, skipped, len(hosts)))
+    if missing:
+        print("::warning::以下条目 Gitee 镜像缺失，已保持 GitHub 优先：%s" % ", ".join(missing))
 
 
 def main():
