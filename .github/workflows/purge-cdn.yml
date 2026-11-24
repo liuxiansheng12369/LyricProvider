@@ -1,0 +1,52 @@
+name: 刷新 CDN 目录缓存
+
+# 构建工作流每次发布完 store-catalog 后，jsDelivr 的边缘节点可能还把旧目录缓存
+# 几十分钟到十几小时，客户端就会一直读到上一版（表现为"商店里看不到新源"）。
+# 这里在构建成功结束后主动 purge 一次，保证国内客户端立刻拿到新目录。
+
+on:
+  workflow_run:
+    workflows: ["上游同步与自动构建"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: purge-cdn-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  purge:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 刷新 jsDelivr 上的商店目录
+        run: |
+          set -uo pipefail
+          FILES=(
+            "catalog/stable.json"
+          )
+          FAILED=0
+          for f in "${FILES[@]}"; do
+            URL="https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@store-catalog/${f}"
+            OK=0
+            for i in 1 2 3 4; do
+              OUT=$(curl -sS --max-time 30 "$URL" || true)
+              echo "$OUT"
+              if printf '%s' "$OUT" | grep -q '"status":"finished"'; then
+                echo "已刷新：${f}"
+                OK=1
+                break
+              fi
+              echo "第 ${i} 次刷新未完成，6 秒后重试"
+              sleep 6
+            done
+            if [ "$OK" -eq 0 ]; then
+              FAILED=1
+              echo "::warning::${f} 的 jsDelivr 缓存未确认刷新，客户端可能仍读到旧目录"
+            fi
+          done
+          exit "$FAILED"
