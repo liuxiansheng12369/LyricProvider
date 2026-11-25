@@ -16,6 +16,7 @@ import json
 import os
 import re
 import subprocess
+import shutil
 import sys
 import tempfile
 import zipfile
