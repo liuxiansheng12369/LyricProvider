@@ -18,13 +18,15 @@ import re
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 DOMAIN = b"CLL-CATALOG-V1\n"
 PROVIDER_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 APPLICATION_ID = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 
-TRUSTED_HOSTS = ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"]
+TRUSTED_HOSTS = ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com", "gitee.com", "raw.giteeusercontent.com"]
+ICON_BASE = "https://gitee.com/luminous-brightness/LyricProvider/raw/store-catalog"
 
 # 模块目录名 -> providerId / 展示名（与客户端 DISPLAY_NAMES 对应，这里只写 providerId）
 MODULE_PROVIDER_ID = {
@@ -99,7 +101,38 @@ def dump_badging(aapt, apk):
         "versionName": package.group(3),
         "minSdk": int(min_sdk.group(1)) if min_sdk else 21,
         "displayName": pick_label(out),
+        "icon": pick_icon(out),
     }
+
+
+def pick_icon(out):
+    """从 aapt badging 里挑最大密度的应用图标资源路径。"""
+    best = None
+    for match in re.finditer(r"application-icon-(\d+):'((?:\\.|[^'])*)'", out):
+        density = int(match.group(1))
+        if density in (65534, 65535):
+            density = 640
+        path = match.group(2)
+        if best is None or density > best[0]:
+            best = (density, path)
+    return best[1] if best else None
+
+
+def export_icon(apk, entry_name, icons_dir, provider_id):
+    """把 APK 里的图标原样抽到 icons 目录，供客户端联网加载。"""
+    if not entry_name:
+        return None
+    try:
+        with zipfile.ZipFile(apk) as archive:
+            data = archive.read(entry_name)
+    except Exception as exc:
+        print("读取图标失败 %s: %s" % (apk, exc), file=sys.stderr)
+        return None
+    os.makedirs(icons_dir, exist_ok=True)
+    dest = os.path.join(icons_dir, provider_id + ".png")
+    with open(dest, "wb") as handle:
+        handle.write(data)
+    return dest
 
 
 def sha256_file(path):
@@ -155,6 +188,7 @@ def main():
     parser.add_argument("--key-id", required=True)
     parser.add_argument("--revision", required=True, type=int)
     parser.add_argument("--validity-days", type=int, default=180)
+    parser.add_argument("--icons-dir", help="图标输出目录：抽出来的 PNG 会写到这里，供 catalog/icons 一起提交")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -234,6 +268,9 @@ def main():
             }
             if info.get("displayName"):
                 entry["displayName"] = info["displayName"]
+            if info.get("icon") and args.icons_dir:
+                if export_icon(apk_path, info["icon"], args.icons_dir, provider_id):
+                    entry["iconUrl"] = "%s/catalog/icons/%s.png" % (ICON_BASE, provider_id)
             notes = read_notes(args.notes_dir, module, entry["versionName"], provider_id)
             if notes:
                 entry["releaseNotes"] = notes
@@ -284,3 +321,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
