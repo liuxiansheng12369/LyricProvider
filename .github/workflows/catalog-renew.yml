@@ -60,6 +60,7 @@ jobs:
             --resign-from "$RUNNER_TEMP/current.json" \
             --notes-dir .github/catalog-notes \
             --icons-dir "$RUNNER_TEMP/catalog-icons" \
+            --icon-pack .github/catalog-icons \
             --key "$RUNNER_TEMP/catalog.pem" \
             --key-id cll-catalog-liuxiansheng-2026a \
             --revision "$NEXT" \
