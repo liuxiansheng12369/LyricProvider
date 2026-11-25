@@ -229,6 +229,7 @@ jobs:
           python3 .github/scripts/gen_catalog.py \
             --apk-dir collected-apks \
             --notes-dir .github/catalog-notes \
+            --icons-dir "$RUNNER_TEMP/catalog-icons" \
             --repo "${{ github.repository }}" \
             --tag "build-${{ steps.stamp.outputs.tag }}" \
             --commit "${{ github.sha }}" \
@@ -258,12 +259,16 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/catalog-repo/catalog"
           cp "$RUNNER_TEMP/catalog-stable.json" "$RUNNER_TEMP/catalog-repo/catalog/stable.json"
+          mkdir -p "$RUNNER_TEMP/catalog-repo/catalog/icons"
+          if [ -d "$RUNNER_TEMP/catalog-icons" ]; then
+            cp -f "$RUNNER_TEMP/catalog-icons/"*.png "$RUNNER_TEMP/catalog-repo/catalog/icons/" || true
+          fi
           cd "$RUNNER_TEMP/catalog-repo"
           git init -q
           git checkout -q -b store-catalog
           git config user.name "liuxiansheng autosync"
           git config user.email "liuxiansheng12369@users.noreply.github.com"
-          git add catalog/stable.json
+          git add catalog
           git commit -q -m "catalog: build-${{ steps.stamp.outputs.tag }}"
           git push -q "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" store-catalog --force
           if [ -n "${GITEE_TOKEN:-}" ]; then
@@ -278,3 +283,4 @@ jobs:
           rm -f release.jks || true
           rm -rf collected-apks || true
           rm -f "$RUNNER_TEMP/catalog.pem" || true
+
