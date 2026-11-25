@@ -101,32 +101,109 @@ def dump_badging(aapt, apk):
         "versionName": package.group(3),
         "minSdk": int(min_sdk.group(1)) if min_sdk else 21,
         "displayName": pick_label(out),
-        "icon": pick_icon(out),
+        "icon": pick_icon_entries(out),
     }
 
 
-def pick_icon(out):
-    """从 aapt badging 里挑最大密度的应用图标资源路径。"""
-    best = None
+RASTER_EXT = (".png", ".webp", ".jpg", ".jpeg")
+
+DENSITY_BUCKETS = {
+    "ldpi": 120, "mdpi": 160, "hdpi": 240, "xhdpi": 320,
+    "xxhdpi": 480, "xxxhdpi": 640,
+}
+
+
+def _density_of(name):
+    best = 0
+    for token, value in DENSITY_BUCKETS.items():
+        if token in name and value > best:
+            best = value
+    return best
+
+
+def pick_icon_entries(out):
+    """aapt badging 里所有候选图标，按密度从高到低排。"""
+    found = []
     for match in re.finditer(r"application-icon-(\d+):'((?:\\.|[^'])*)'", out):
         density = int(match.group(1))
         if density in (65534, 65535):
             density = 640
-        path = match.group(2)
-        if best is None or density > best[0]:
-            best = (density, path)
-    return best[1] if best else None
+        found.append((density, match.group(2)))
+    found.sort(reverse=True)
+    return [item[1] for item in found]
 
 
-def export_icon(apk, entry_name, icons_dir, provider_id):
-    """把 APK 里的图标原样抽到 icons 目录，供客户端联网加载。"""
-    if not entry_name:
-        return None
-    try:
+def read_resource_table(aapt, apk):
+    """解析 aapt2 dump resources：资源 id -> (资源名, 文件路径, 类型)。"""
+    out = subprocess.run(
+        [aapt, "dump", "resources", apk],
+        capture_output=True,
+        text=True,
+        errors="ignore",
+    ).stdout
+    table = {}
+    pending = None
+    for line in out.splitlines():
+        match = re.match(r"\s+resource (0x[0-9a-fA-F]+) ([A-Za-z0-9_.]+/[A-Za-z0-9_.\-]+)", line)
+        if match:
+            pending = match.group(1).lower()
+            table.setdefault(pending, [])
+            table[pending].append(None)
+            continue
+        file_match = re.match(r"\s+\(\) \(file\) (\S+) type=([A-Za-z0-9_]+)", line)
+        if file_match and pending:
+            table[pending][-1] = (file_match.group(1), file_match.group(2))
+    return {key: [item for item in value if item] for key, value in table.items()}
+
+
+def dump_xml_references(aapt, apk, entry_name):
+    """从自适应图标/矢量图的 XML 里读出引用到的资源 id。"""
+    out = subprocess.run(
+        [aapt, "dump", "xmltree", apk, "--file", entry_name],
+        capture_output=True,
+        text=True,
+        errors="ignore",
+    ).stdout
+    return [item.lower() for item in re.findall(r"@0x([0-9a-fA-F]{8})", out)]
+
+
+def _resolve_icon_bytes(aapt, apk, path, table):
+    """候选是栅格图就直接读；是 XML 就顺着资源表找能用的栅格图。"""
+    if path.lower().endswith(RASTER_EXT):
         with zipfile.ZipFile(apk) as archive:
-            data = archive.read(entry_name)
-    except Exception as exc:
-        print("读取图标失败 %s: %s" % (apk, exc), file=sys.stderr)
+            return archive.read(path)
+    if not path.lower().endswith(".xml"):
+        return None
+    refs = dump_xml_references(aapt, apk, path)
+    candidates = []
+    for ref in refs:
+        for file_path, file_type in table.get(ref, []):
+            if file_path.lower().endswith(RASTER_EXT):
+                candidates.append(file_path)
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda name: (_density_of(name), name))
+    with zipfile.ZipFile(apk) as archive:
+        return archive.read(best)
+
+
+def export_icon(aapt, apk, candidates, icons_dir, provider_id):
+    """按密度从高到低挑一张能真正解码的图标，抽成文件，供客户端联网加载。"""
+    if isinstance(candidates, str):
+        candidates = [candidates]
+    table = read_resource_table(aapt, apk)
+    data = None
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            data = _resolve_icon_bytes(aapt, apk, candidate, table)
+        except Exception as exc:
+            print("读取图标失败 %s(%s): %s" % (apk, candidate, exc), file=sys.stderr)
+            data = None
+        if data:
+            break
+    if not data:
         return None
     os.makedirs(icons_dir, exist_ok=True)
     dest = os.path.join(icons_dir, provider_id + ".png")
@@ -269,7 +346,7 @@ def main():
             if info.get("displayName"):
                 entry["displayName"] = info["displayName"]
             if info.get("icon") and args.icons_dir:
-                if export_icon(apk_path, info["icon"], args.icons_dir, provider_id):
+                if export_icon(aapt, apk_path, info["icon"], args.icons_dir, provider_id):
                     entry["iconUrl"] = "%s/catalog/icons/%s.png" % (ICON_BASE, provider_id)
             notes = read_notes(args.notes_dir, module, entry["versionName"], provider_id)
             if notes:
