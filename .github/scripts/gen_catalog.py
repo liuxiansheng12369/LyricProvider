@@ -16,18 +16,15 @@ import json
 import os
 import re
 import subprocess
-import shutil
 import sys
 import tempfile
-import zipfile
 
 DOMAIN = b"CLL-CATALOG-V1\n"
 PROVIDER_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 APPLICATION_ID = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 
-TRUSTED_HOSTS = ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com", "gitee.com", "raw.giteeusercontent.com"]
-ICON_BASE = "https://gitee.com/luminous-brightness/LyricProvider/raw/store-catalog"
+TRUSTED_HOSTS = ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"]
 
 # 模块目录名 -> providerId / 展示名（与客户端 DISPLAY_NAMES 对应，这里只写 providerId）
 MODULE_PROVIDER_ID = {
@@ -63,27 +60,10 @@ def find_aapt():
     if not os.path.isdir(build_tools):
         return None
     for name in sorted(os.listdir(build_tools), reverse=True):
-        for binary in ("aapt2", "aapt"):
+        for binary in ("aapt2", "aapt2.exe", "aapt", "aapt.exe"):
             path = os.path.join(build_tools, name, binary)
             if os.path.isfile(path) and os.access(path, os.X_OK):
                 return path
-    return None
-
-
-def pick_label(out):
-    """从 aapt badging 里挑展示名：优先中文标签，其次默认标签。"""
-    candidates = []
-    for key in ("zh-CN", "zh-Hans-CN", "zh", ""):
-        suffix = ("-" + key) if key else ""
-        pattern = "application-label" + re.escape(suffix) + r":'((?:\\.|[^'])*)'"
-        match = re.search(pattern, out)
-        if match:
-            raw = match.group(1).replace("\\'", "'").replace("\\\\", "\\")
-            candidates.append(raw)
-    for raw in candidates:
-        text = re.sub(r"\s+", " ", raw).strip()
-        if text:
-            return text[:40]
     return None
 
 
@@ -101,116 +81,7 @@ def dump_badging(aapt, apk):
         "versionCode": int(package.group(2)),
         "versionName": package.group(3),
         "minSdk": int(min_sdk.group(1)) if min_sdk else 21,
-        "displayName": pick_label(out),
-        "icon": pick_icon_entries(out),
     }
-
-
-RASTER_EXT = (".png", ".webp", ".jpg", ".jpeg")
-
-DENSITY_BUCKETS = {
-    "ldpi": 120, "mdpi": 160, "hdpi": 240, "xhdpi": 320,
-    "xxhdpi": 480, "xxxhdpi": 640,
-}
-
-
-def _density_of(name):
-    best = 0
-    for token, value in DENSITY_BUCKETS.items():
-        if token in name and value > best:
-            best = value
-    return best
-
-
-def pick_icon_entries(out):
-    """aapt badging 里所有候选图标，按密度从高到低排。"""
-    found = []
-    for match in re.finditer(r"application-icon-(\d+):'((?:\\.|[^'])*)'", out):
-        density = int(match.group(1))
-        if density in (65534, 65535):
-            density = 640
-        found.append((density, match.group(2)))
-    found.sort(reverse=True)
-    return [item[1] for item in found]
-
-
-def read_resource_table(aapt, apk):
-    """解析 aapt2 dump resources：资源 id -> (资源名, 文件路径, 类型)。"""
-    out = subprocess.run(
-        [aapt, "dump", "resources", apk],
-        capture_output=True,
-        text=True,
-        errors="ignore",
-    ).stdout
-    table = {}
-    pending = None
-    for line in out.splitlines():
-        match = re.match(r"\s+resource (0x[0-9a-fA-F]+) ([A-Za-z0-9_.]+/[A-Za-z0-9_.\-]+)", line)
-        if match:
-            pending = match.group(1).lower()
-            table.setdefault(pending, [])
-            table[pending].append(None)
-            continue
-        file_match = re.match(r"\s+\(\) \(file\) (\S+) type=([A-Za-z0-9_]+)", line)
-        if file_match and pending:
-            table[pending][-1] = (file_match.group(1), file_match.group(2))
-    return {key: [item for item in value if item] for key, value in table.items()}
-
-
-def dump_xml_references(aapt, apk, entry_name):
-    """从自适应图标/矢量图的 XML 里读出引用到的资源 id。"""
-    out = subprocess.run(
-        [aapt, "dump", "xmltree", apk, "--file", entry_name],
-        capture_output=True,
-        text=True,
-        errors="ignore",
-    ).stdout
-    return [item.lower() for item in re.findall(r"@0x([0-9a-fA-F]{8})", out)]
-
-
-def _resolve_icon_bytes(aapt, apk, path, table):
-    """候选是栅格图就直接读；是 XML 就顺着资源表找能用的栅格图。"""
-    if path.lower().endswith(RASTER_EXT):
-        with zipfile.ZipFile(apk) as archive:
-            return archive.read(path)
-    if not path.lower().endswith(".xml"):
-        return None
-    refs = dump_xml_references(aapt, apk, path)
-    candidates = []
-    for ref in refs:
-        for file_path, file_type in table.get(ref, []):
-            if file_path.lower().endswith(RASTER_EXT):
-                candidates.append(file_path)
-    if not candidates:
-        return None
-    best = max(candidates, key=lambda name: (_density_of(name), name))
-    with zipfile.ZipFile(apk) as archive:
-        return archive.read(best)
-
-
-def export_icon(aapt, apk, candidates, icons_dir, provider_id):
-    """按密度从高到低挑一张能真正解码的图标，抽成文件，供客户端联网加载。"""
-    if isinstance(candidates, str):
-        candidates = [candidates]
-    table = read_resource_table(aapt, apk)
-    data = None
-    for candidate in candidates:
-        if not candidate:
-            continue
-        try:
-            data = _resolve_icon_bytes(aapt, apk, candidate, table)
-        except Exception as exc:
-            print("读取图标失败 %s(%s): %s" % (apk, candidate, exc), file=sys.stderr)
-            data = None
-        if data:
-            break
-    if not data:
-        return None
-    os.makedirs(icons_dir, exist_ok=True)
-    dest = os.path.join(icons_dir, provider_id + ".png")
-    with open(dest, "wb") as handle:
-        handle.write(data)
-    return dest
 
 
 def sha256_file(path):
@@ -230,6 +101,30 @@ def apk_signer_sha256(apksigner, apk):
     if not match:
         raise SystemExit("无法读取 %s 的签名证书" % apk)
     return match.group(1)
+
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ICON_URL_TEMPLATE = (
+    "https://gitee.com/luminous-brightness/LyricProvider/raw/store-catalog/catalog/icons/%s.png"
+)
+
+
+def load_catalog_meta():
+    """读 .github/catalog-meta.json（providerId -> 显示名），缺文件就当空表。"""
+    path = os.path.join(REPO_ROOT, ".github", "catalog-meta.json")
+    if not os.path.isfile(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    return {str(k): str(v) for k, v in data.items() if not str(k).startswith("_")}
+
+
+def icon_url_for(provider_id):
+    """图标随仓库走：.github/catalog-icons/<providerId>.png 存在就给 iconUrl，由发布步骤拷进目录分支。"""
+    path = os.path.join(REPO_ROOT, ".github", "catalog-icons", provider_id + ".png")
+    if os.path.isfile(path):
+        return ICON_URL_TEMPLATE % provider_id
+    return None
 
 
 def read_notes(notes_dir, module, version_name, provider_id):
@@ -266,7 +161,6 @@ def main():
     parser.add_argument("--key-id", required=True)
     parser.add_argument("--revision", required=True, type=int)
     parser.add_argument("--validity-days", type=int, default=180)
-    parser.add_argument("--icons-dir", help="图标输出目录：抽出来的 PNG 会写到这里，供 catalog/icons 一起提交")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -301,14 +195,20 @@ def main():
         if not aapt:
             raise SystemExit("找不到 aapt2/aapt，无法读取 APK 元信息")
 
-        apksigner = os.path.join(os.path.dirname(aapt), "apksigner")
-        if not os.path.isfile(apksigner):
+        apksigner = None
+        for candidate in ("apksigner", "apksigner.bat", "apksigner.exe"):
+            path = os.path.join(os.path.dirname(aapt), candidate)
+            if os.path.isfile(path):
+                apksigner = path
+                break
+        if not apksigner:
             raise SystemExit("找不到 apksigner")
 
         if not HEX40.match(args.commit):
             raise SystemExit("commit 必须是 40 位十六进制")
 
         entries = []
+        meta = load_catalog_meta()
 
         for name in sorted(os.listdir(args.apk_dir)):
             if not name.endswith("-release.apk"):
@@ -344,14 +244,15 @@ def main():
                     "signerSha256": [apk_signer_sha256(apksigner, apk_path)],
                 },
             }
-            if info.get("displayName"):
-                entry["displayName"] = info["displayName"]
-            if info.get("icon") and args.icons_dir:
-                if export_icon(aapt, apk_path, info["icon"], args.icons_dir, provider_id):
-                    entry["iconUrl"] = "%s/catalog/icons/%s.png" % (ICON_BASE, provider_id)
             notes = read_notes(args.notes_dir, module, entry["versionName"], provider_id)
             if notes:
                 entry["releaseNotes"] = notes
+            display_name = meta.get(provider_id)
+            if display_name:
+                entry["displayName"] = display_name
+            icon_url = icon_url_for(provider_id)
+            if icon_url:
+                entry["iconUrl"] = icon_url
             entries.append(entry)
 
     if not entries:
@@ -399,4 +300,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

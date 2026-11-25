@@ -78,26 +78,75 @@ jobs:
           fi
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
+      - name: 同步第三方源
+        id: tp
+        run: |
+          set -euo pipefail
+          CHANGED=false
+
+          sync_one() {
+            local id=$1 url=$2
+            local dir="thirdparty/$id"
+            local want have
+            want=$(grep -m1 '当前基线提交：' "$dir/UPSTREAM.md" | sed 's/.*：//' | tr -d '[:space:]')
+            rm -rf "$RUNNER_TEMP/tp-$id"
+            git clone --depth 1 --quiet "$url" "$RUNNER_TEMP/tp-$id"
+            have=$(git -C "$RUNNER_TEMP/tp-$id" rev-parse HEAD)
+            echo "$id 上游=$have 基线=$want"
+            if [ "$have" = "$want" ]; then
+              echo "$id 无更新"
+              return 0
+            fi
+            rsync -a --delete \
+              --exclude '.git' --exclude 'build' --exclude '.gradle' --exclude '.idea' \
+              --exclude 'local.properties' \
+              "$RUNNER_TEMP/tp-$id/" "$dir/"
+            sed -i "s|当前基线提交：.*|当前基线提交：$have|" "$dir/UPSTREAM.md"
+            CHANGED=true
+          }
+
+          sync_one kugou-lite https://github.com/OneDongua/KugouLiteProvider.git
+          sync_one mei https://github.com/jwbb903/LyriconProvider-Mei.git
+          sync_one pixelplay https://github.com/ininan/pixelplay-lyricon-provider.git
+
+          if [ "$CHANGED" = true ]; then
+            git add thirdparty
+            git commit -q -m "chore(thirdparty): 同步第三方源 $(date -u +%Y-%m-%d)" || true
+            git push origin HEAD:master
+          fi
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+
+      - name: 判断是否需要构建
+        id: gate
+        if: always()
+        run: |
+          BUILD=false
+          if [ "${{ steps.sync.outputs.changed }}" = "true" ] || [ "${{ steps.tp.outputs.changed }}" = "true" ]; then
+            BUILD=true
+          fi
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "本次是否构建：$BUILD"
+
       - name: 配置 JDK 21
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.gate.outputs.build == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
 
       - name: 赋予 gradlew 执行权限
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.gate.outputs.build == 'true'
         run: chmod +x ./gradlew
 
       - name: 配置 Gradle 缓存
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.gate.outputs.build == 'true'
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: wrapper
           cache-disabled: false
 
       - name: 解码签名证书
-        if: steps.sync.outputs.changed == 'true' && env.BUILD_TYPE == 'release'
+        if: steps.gate.outputs.build == 'true' && env.BUILD_TYPE == 'release'
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
           KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
@@ -115,7 +164,7 @@ jobs:
             -storepass "$KEY_STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1
 
       - name: 构建 APK
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.gate.outputs.build == 'true'
         env:
           RELEASE_STORE_FILE: ${{ github.workspace }}/release.jks
           RELEASE_STORE_PASSWORD: ${{ env.BUILD_TYPE == 'release' && secrets.KEY_STORE_PASSWORD || '' }}
@@ -127,13 +176,25 @@ jobs:
             -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
             --build-cache --continue --stacktrace
 
+      - name: 构建第三方源
+        if: steps.gate.outputs.build == 'true'
+        env:
+          RELEASE_STORE_FILE: ${{ github.workspace }}/release.jks
+          RELEASE_STORE_PASSWORD: ${{ env.BUILD_TYPE == 'release' && secrets.KEY_STORE_PASSWORD || '' }}
+          RELEASE_KEY_ALIAS: ${{ env.BUILD_TYPE == 'release' && secrets.ALIAS || '' }}
+          RELEASE_KEY_PASSWORD: ${{ env.BUILD_TYPE == 'release' && secrets.KEY_PASSWORD || '' }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/build_thirdparty.sh tp-apks
+
       - name: 收集 APK
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.gate.outputs.build == 'true'
         run: |
           set -euo pipefail
           mkdir -p collected-apks
           mapfile -d '' APK_FILES < <(
-            find . -type f -name "*.apk" -path "*/build/outputs/apk/${BUILD_TYPE}/*" -print0
+            find . -type f -name "*.apk" -path "*/build/outputs/apk/${BUILD_TYPE}/*" \
+              -not -path "./thirdparty/*" -print0
           )
           if (( ${#APK_FILES[@]} == 0 )); then
             echo "::error::未生成任何 ${BUILD_TYPE} APK。"
@@ -142,6 +203,14 @@ jobs:
           for apk in "${APK_FILES[@]}"; do
             cp -- "$apk" "collected-apks/$(basename "$apk")"
           done
+          if compgen -G "tp-apks/*.apk" > /dev/null; then
+            for apk in tp-apks/*.apk; do
+              cp -- "$apk" "collected-apks/$(basename "$apk")"
+            done
+          else
+            echo "::error::第三方源没有产出 APK。"
+            exit 1
+          fi
           (
             cd collected-apks
             sha256sum *.apk > SHA256SUMS
@@ -149,7 +218,7 @@ jobs:
           ls -lh collected-apks/
 
       - name: 上传制品
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.gate.outputs.build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BUILD_TYPE }}-apks
@@ -158,14 +227,14 @@ jobs:
           retention-days: 90
 
       - name: 生成发布标记
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.gate.outputs.build == 'true'
         id: stamp
         run: |
           echo "tag=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
           echo "label=$(date -u +'%Y-%m-%d %H:%M')" >> "$GITHUB_OUTPUT"
 
       - name: 发布
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.gate.outputs.build == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ steps.stamp.outputs.tag }}
@@ -181,7 +250,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 同步代码到 Gitee 镜像
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.gate.outputs.build == 'true'
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         run: |
@@ -192,7 +261,7 @@ jobs:
             "HEAD:master"
 
       - name: 同步附件到 Gitee 镜像
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.gate.outputs.build == 'true'
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         run: |
@@ -205,7 +274,7 @@ jobs:
             --name "Build ${{ steps.stamp.outputs.label }}"
 
       - name: 准备目录签名密钥
-        if: steps.sync.outputs.changed == 'true' && env.BUILD_TYPE == 'release'
+        if: steps.gate.outputs.build == 'true' && env.BUILD_TYPE == 'release'
         env:
           CATALOG_KEY: ${{ secrets.CATALOG_KEY }}
         run: |
@@ -215,7 +284,7 @@ jobs:
           test -s "$RUNNER_TEMP/catalog.pem"
 
       - name: 生成商店目录
-        if: steps.sync.outputs.changed == 'true' && env.BUILD_TYPE == 'release'
+        if: steps.gate.outputs.build == 'true' && env.BUILD_TYPE == 'release'
         run: |
           set -euo pipefail
           git fetch origin store-catalog 2>/dev/null || true
@@ -229,8 +298,6 @@ jobs:
           python3 .github/scripts/gen_catalog.py \
             --apk-dir collected-apks \
             --notes-dir .github/catalog-notes \
-            --icons-dir "$RUNNER_TEMP/catalog-icons" \
-            --icon-pack .github/catalog-icons \
             --repo "${{ github.repository }}" \
             --tag "build-${{ steps.stamp.outputs.tag }}" \
             --commit "${{ github.sha }}" \
@@ -240,7 +307,7 @@ jobs:
             --out "$RUNNER_TEMP/catalog-stable.json"
 
       - name: 目录前置 Gitee 直链
-        if: steps.sync.outputs.changed == 'true' && env.BUILD_TYPE == 'release'
+        if: steps.gate.outputs.build == 'true' && env.BUILD_TYPE == 'release'
         run: |
           set -euo pipefail
           python3 .github/scripts/gitee_mirror.py urls \
@@ -252,18 +319,15 @@ jobs:
             --out "$RUNNER_TEMP/catalog-stable.json"
 
       - name: 发布商店目录
-        if: steps.sync.outputs.changed == 'true' && env.BUILD_TYPE == 'release'
+        if: steps.gate.outputs.build == 'true' && env.BUILD_TYPE == 'release'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/catalog-repo/catalog"
-          cp "$RUNNER_TEMP/catalog-stable.json" "$RUNNER_TEMP/catalog-repo/catalog/stable.json"
           mkdir -p "$RUNNER_TEMP/catalog-repo/catalog/icons"
-          if [ -d "$RUNNER_TEMP/catalog-icons" ]; then
-            cp -f "$RUNNER_TEMP/catalog-icons/"*.png "$RUNNER_TEMP/catalog-repo/catalog/icons/" || true
-          fi
+          cp "$RUNNER_TEMP/catalog-stable.json" "$RUNNER_TEMP/catalog-repo/catalog/stable.json"
+          cp .github/catalog-icons/*.png "$RUNNER_TEMP/catalog-repo/catalog/icons/"
           cd "$RUNNER_TEMP/catalog-repo"
           git init -q
           git checkout -q -b store-catalog
@@ -284,4 +348,3 @@ jobs:
           rm -f release.jks || true
           rm -rf collected-apks || true
           rm -f "$RUNNER_TEMP/catalog.pem" || true
-

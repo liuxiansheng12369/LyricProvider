@@ -1,0 +1,46 @@
+name: 第三方源构建自检
+
+# 只验证 thirdparty/ 下三个源能否编译通过，不发布、不改目录。改完源码先跑这个。
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'thirdparty/**'
+      - '.github/scripts/build_thirdparty.sh'
+      - '.github/workflows/thirdparty-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 编译第三方源
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 配置 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: 配置 Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: false
+
+      - name: 编译三个源
+        run: bash .github/scripts/build_thirdparty.sh tp-apks
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: thirdparty-apks
+          path: tp-apks/
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,9 @@
+# 脚本与 CI 在 Linux 上跑，强制 LF
+*.sh text eol=lf
+*.yml text eol=lf
+*.py text eol=lf
+
+# 二进制图标不要做换行转换
+*.png binary
+*.jar binary
+*.apk binary
