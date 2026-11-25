@@ -79,9 +79,9 @@ object MiuiMusic : YukiBaseHooker(), DownloadCallback {
                     val rawArtist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST)
                     val album = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM)
 
-                    val (title, artist) = splitTitleArtist(rawTitle, rawArtist)
+                    val (songName, singerName) = splitTitleArtist(rawTitle, rawArtist)
 
-                    val signature = calculateSignature(id, title, artist, album)
+                    val signature = calculateSignature(id, songName, singerName, album)
                     if (signature == lastMediaSignature) {
                         YLog.debug(tag = TAG, msg = "Same metadata, skip")
                         return@after
@@ -91,21 +91,21 @@ object MiuiMusic : YukiBaseHooker(), DownloadCallback {
 
                     YLog.debug(
                         tag = TAG,
-                        msg = "Metadata: id=$id, rawTitle=$rawTitle, rawArtist=$rawArtist -> title=$title, artist=$artist, album=$album"
+                        msg = "Metadata: id=$id, rawTitle=$rawTitle, rawArtist=$rawArtist -> song=$songName, singer=$singerName, album=$album"
                     )
 
                     provider?.player?.setSong(
                         Song(
-                            name = title,
-                            artist = artist,
+                            name = songName,
+                            artist = singerName,
                         )
                     )
 
                     DownloadManager.cancel()
 
                     DownloadManager.search(this@MiuiMusic) {
-                        trackName = title
-                        artistName = artist
+                        trackName = songName
+                        artistName = singerName
                         albumName = album
                         perProviderLimit = 5
                         maxTotalResults = 1
@@ -161,4 +161,3 @@ object MiuiMusic : YukiBaseHooker(), DownloadCallback {
         this.duration = duration
     }
 }
-
